@@ -2,38 +2,13 @@ from Crypto.Cipher import AES  # Requires PyCryptodome
 from Crypto.Util.Padding import pad, unpad
 import requests
 from pprint import pp
+import textwrap
 
 BLOCK_SIZE = 16
 
-def single_block_attack(block, oracle):
-    """Returns the decryption of the given ciphertext block"""
+p = lambda *args, **kvargs: print(*args, **kvargs)
 
-    # zeroing_iv starts out nulled. each iteration of the main loop will add
-    # one byte to it, working from right to left, until it is fully populated,
-    # at which point it contains the result of DEC(ct_block)
-    zeroing_iv = [0] * BLOCK_SIZE
 
-    for pad_val in range(1, BLOCK_SIZE+1):
-        padding_iv = [pad_val ^ b for b in zeroing_iv]
-
-        for candidate in range(256):
-            padding_iv[-pad_val] = candidate
-            iv = bytes(padding_iv)
-            if oracle(iv, block):
-                if pad_val == 1:
-                    # make sure the padding really is of length 1 by changing
-                    # the penultimate block and querying the oracle again
-                    padding_iv[-2] ^= 1
-                    iv = bytes(padding_iv)
-                    if not oracle(iv, block):
-                        continue  # false positive; keep searching
-                break
-        else:
-            raise Exception("no valid padding byte found (is the oracle working correctly?)")
-
-        zeroing_iv[-pad_val] = candidate ^ pad_val
-
-    return zeroing_iv
 
 LOCAL_PORT = 5000
 LOCAL_IP = "127.0.0.1"
@@ -42,32 +17,67 @@ URL = f"http://{LOCAL_IP}:{LOCAL_PORT}/"
 REMOTE_DOMAIN = "https://cbc-rsa.netsec22.dk:"
 REMOTE_PORT = 8000
 
+
+xor = lambda A, B: bytearray([a ^ b for a, b in zip(A, B)])
+
+def ask_oracle_about_valid_padding(ciphertext: str):
+    cookies = {
+        # 'authtoken': bytes.hex(b''.join([b'0x00' * 15, b'0x01']))
+        'authtoken': ciphertext
+    }
+    resp = requests.get(URL + "quote", cookies=cookies)
+    p({'resp.content': resp.content})
+    return resp.content == "No quote for you!"
+
+def ciphertext_block_to_cleartext_block(ct_blocks, current_ciphertext_block: str, previous_ciphertext_block: str) -> str:
+
+    # [0x00, 0x00, ..., 0x00] NOT valid padding, but initial value
+    # [..., 0x01]
+    # [..., 0x02, 0x02] 
+    # [..., 0x03,0x03,0x03]
+    # ...
+    # [0x10, 0x10, ..., 0x10]
+    plaintext_bytes = bytearray([0 for _ in range(16)])
+
+    for i in range(16): # loop through each byte in 128 bit (16 bytes) AES ciphertext block.
+        expected_padding = bytearray([0 for _ in range(16 - i)] + [(i+1) for _ in range(i)])
+        c_prime = xor(xor(expected_padding, bytearray(plaintext_bytes)), bytearray(current_ciphertext_block, encoding="utf-8"))
+         
+        for byte in range(0, 256): # loop through each byte value that the padding byte can have.
+            c_prime[15-i] = byte
+            to_test = str(c_prime,  encoding="utf-8") + current_ciphertext_block
+            # try decryption
+            # i.e. send request to server
+            correct = ask_oracle_about_valid_padding(to_test)
+            # if successful
+            if correct:
+                plaintext_bytes[15-i]= byte ^ (i + 1) ^ current_block[15 - i]
+
+    return str(plaintext_bytes, encoding="utf-8")
+
+# assume that ciphertext % block_size = 0
+def split_into_ciphertext_blocks(ciphertext: str, block_size: int=16):
+    return textwrap.wrap(ciphertext, block_size)
+
+
 if __name__ ==  '__main__':
     headers = {'Accept-Encoding': 'identity'}
+    # send get request to server to get authtoken
     r = requests.get( URL, headers=headers)
-
-    #print(r.text)
     authtoken = r.headers.get('Set-Cookie').split(';')[0].split('=')[1]
-    # print(authtoken)
     iv = authtoken[:16]
     ct = authtoken[16:]
-    pp({'iv':iv,'ct':ct})
-    # print(f'iv = {iv}')
-    len_of_ct = len(bytes.hex(bytes(ct,'utf-8')))
-    print(len_of_ct)
-    # assert len_of_ct == 128
+    ct_blocks = split_into_ciphertext_blocks(ct)
 
-    cookies = {
-        'authtoken': bytes.hex(b''.join([b'0x00' * 15, b'0x01']))
-    }
-    pp(cookies)
+    cleartext = ""
+    for i in range(len(ct_blocks)):
+        p({'len(ct_blocks)': len(ct_blocks), 'i': i})
+        current_block = ct_blocks[len(ct_blocks)-i-1]
+        previous_block = ct_blocks[len(ct_blocks)-i-2]
+        cleartext = ciphertext_block_to_cleartext_block(ct_blocks, current_block, previous_block) + cleartext
     
-    # Checking if a quote is recieved
-    possible_quote = requests.get(URL + "quote", cookies=cookies)
-    print(f"QUOTE REPLY: {possible_quote.text}")
-    """
-    if(possible_quote.text != "No quote for you!"): # or possible_quote.text != "<p>Here, have a cookie!</p>"
-        print("Task not completed")
-    else:
-        print(f"TASK COMPLETED! Quote is: {possible_quote.text}")
-    """
+    # the first block does not have a previous block, it used the iv instead
+    cleartext = ciphertext_block_to_cleartext_block(ct_blocks, ct_blocks[0], iv) + cleartext
+
+
+    p("cleartext: " + cleartext)
