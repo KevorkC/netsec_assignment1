@@ -22,6 +22,7 @@ xor = lambda A, B: bytearray([a ^ b for a, b in zip(A, B)])
 
 
 def ask_oracle_about_valid_padding(ciphertext: str):
+    p("ciphertext:", ciphertext)
     cookies = {
         # 'authtoken': bytes.hex(b''.join([b'0x00' * 15, b'0x01']))
         "authtoken": ciphertext
@@ -54,8 +55,8 @@ def ciphertext_block_to_cleartext_block(
             [0 for _ in range(16 - i)] + [(i + 1) for _ in range(i)]
         )
         c_prime = xor(
-            xor(expected_padding, bytearray(plaintext_bytes)),
-            bytearray(current_ciphertext_block, encoding="utf-8"),
+            xor(expected_padding,plaintext_bytes),
+            bytearray(previous_ciphertext_block, encoding="ascii"),
         )
 
         for byte in range(
@@ -67,7 +68,10 @@ def ciphertext_block_to_cleartext_block(
             # ...
             # [0x00, 0x00, ..., 0xff]
             c_prime[15 - i] = byte
-            to_test = str(c_prime, encoding="utf-8") + current_ciphertext_block
+            p("byte:", byte)
+            p({"c_prime": c_prime})
+            to_test = str(c_prime, encoding="ascii") + current_ciphertext_block
+            p({"to_test": to_test})
             # try decryption
             # i.e. send request to server
             correct = ask_oracle_about_valid_padding(to_test)
@@ -93,7 +97,7 @@ if __name__ == "__main__":
     ct_blocks = split_into_ciphertext_blocks(ct)
 
     cleartext = ""
-    for i in range(len(ct_blocks)):
+    for i in range(len(ct_blocks)-1):
         p({"len(ct_blocks)": len(ct_blocks), "i": i})
         current_block = ct_blocks[len(ct_blocks) - i - 1]
         previous_block = ct_blocks[len(ct_blocks) - i - 2]
