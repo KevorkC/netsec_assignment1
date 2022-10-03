@@ -9,7 +9,9 @@ from secret_data import rsa_key
 #from DataPrimitives import I20SP, OS2IP, mgf1
 from Crypto.PublicKey import RSA
 from Crypto.Signature.pss import MGF1
-
+from Crypto.Hash import SHA256
+import pretty_errors
+from pprint import pp
 
 def xor(a: bytes, b: bytes) -> bytes:
     return bytes(_a ^ _b for _a, _b in zip(a, b))
@@ -33,8 +35,8 @@ I20SP = i2osp_ecc
 OS2IP = os2ip_ecc
 
 # # Source: https://en.wikipedia.org/wiki/Mask_generation_function
-# def mgf1(seed: bytes, length: int, hash_func=hashlib.sha256) -> bytes:
-#     hLen = hash_func().digest_size
+# def mgf1(seed: bytes, length: int, hash_func=SHA256) -> bytes:
+#     hLen = hash_func.digest_size
 #     # https://www.ietf.org/rfc/rfc2437.txt
 #     # 1.If l > 2^32(hLen), output "mask too long" and stop.
 #     if length > (hLen << 32):
@@ -90,7 +92,7 @@ OS2IP = os2ip_ecc
 
 
 
-def emsa_pss_encode(M: bytes, emBits: int, hash_func=hashlib.sha256, MGF=MGF1, sLen: int=0) -> bytes:
+def emsa_pss_encode(M: bytes, emBits: int, hash_func=SHA256, MGF=MGF1, sLen: int=0) -> bytes:
     """ Options:
 
     Hash     hash function (hLen denotes the length in octets of the hash
@@ -116,10 +118,10 @@ def emsa_pss_encode(M: bytes, emBits: int, hash_func=hashlib.sha256, MGF=MGF1, s
         raise Exception("Message too long")
     
     # Step 2. Let mHash = Hash(M), an octet string of length hLen.
-    mHash = hash_func(M).digest()
+    mHash = hash_func.new(M).digest()
 
     # Step 3. If emLen < hLen + sLen + 2, output "encoding error" and stop.
-    hLen = hash_func().digest_size
+    hLen = hash_func.digest_size
     emLen = math.ceil(emBits / 8)
     if(emLen < hLen + sLen + 2):
         raise Exception("Encoding error")
@@ -137,7 +139,7 @@ def emsa_pss_encode(M: bytes, emBits: int, hash_func=hashlib.sha256, MGF=MGF1, s
     M_prime = b"0x00" * 8 + mHash + salt
 
     # Step 6. Let H = Hash(M'), an octet string of length hLen.
-    H = hash_func(M_prime).digest()
+    H = hash_func.new(M_prime).digest()
 
     # Step 7. Generate an octet string PS consisting of emLen - sLen - hLen - 2
     # zero octets.  The length of PS may be 0.
@@ -148,7 +150,7 @@ def emsa_pss_encode(M: bytes, emBits: int, hash_func=hashlib.sha256, MGF=MGF1, s
     DB = PS + b"\x01" + salt
 
     # Step 9. Let dbMask = MGF(H, emLen - hLen - 1).
-    dbMask = MGF(H, emLen - hLen - 1, hash_func())
+    dbMask = MGF(H, emLen - hLen - 1, hash_func)
 
     # Step 10. Let maskedDB = DB \xor dbMask.
     # TODO: Use consistent xor in encode and verify
@@ -204,7 +206,7 @@ def RSAVP1(N: int, e: int, s: int) -> int:
     m = pow(s, e, N)
     return m
 
-def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=hashlib.sha256, sLen: int=0, MGF=MGF1) -> bool:
+def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=SHA256, sLen: int=0, MGF=MGF1) -> bool:
     """     
     Input:
     M        message to be verified, an octet string
@@ -227,11 +229,11 @@ def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=hashlib.sha256, 
     #    return False
     
     # Step 2. Let mHash = Hash(M), an octet string of length hLen.
-    mHash = hash_func(M).digest()
+    mHash = hash_func.new(M).digest()
 
     # Step 3. If emLen < hLen + sLen + 2, output "inconsistent" and stop.
-    hLen = hash_func().digest_size
-    assert hash_func().digest_size == len(mHash)
+    hLen = hash_func.digest_size
+    assert hash_func.digest_size == len(mHash)
     emLen = math.ceil(emBits / 8)
 
     assert emLen >= hLen + sLen + 2, f"emLen ({emLen}) < hLen ({hLen}) + sLen ({sLen}) + 2"
@@ -259,12 +261,27 @@ def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=hashlib.sha256, 
     dbMask = MGF(H, emLen - hLen - 1, hash_func)
 
     # Step 8. Let DB = maskedDB \xor dbMask.
-    DB = bytes([maskedDB[i] ^ dbMask[i] for i in range(len(maskedDB))])
+    DB = xor(maskedDB, dbMask)
+    #DB = bytes([maskedDB[i] ^ dbMask[i] for i in range(len(maskedDB))])
 
     # Step 9. Set the leftmost 8*emLen - emBits bits of the leftmost octet in
     # DB to zero.
+
+    # Bitmask of digits that fill up
+    lmask = 0
+    for i in range(number_of_leftmost_bits):
+        lmask = lmask >> 1 | 0x80
+
+
+    bchr = lambda x: chr(str(x))
+    bord = lambda x: ord(str(x))
+
+    # TODO: LEFT OFF HERE, Kevork Kristoffer
+    pp({"DB[0]": DB[0], "bord(DB[0])": bord(DB[0]), "~lmask": ~lmask, "bchr(bord(DB[0]) & ~lmask)": bchr(bord(DB[0]) & ~lmask)})
+    DB = bchr(bord(DB[0]) & ~lmask) + DB[1:]
+
     # TODO: Maybe implement this line in multiple steps
-    DB = bytes([DB[0] & (0xff >> number_of_leftmost_bits)]) + DB[1:]
+    # DB = bytes([DB[0] & (0xff >> number_of_leftmost_bits)]) + DB[1:]
 
     # Step 10. If the emLen - hLen - sLen - 2 leftmost octets of DB are not
     # zero or if the octet at position emLen - hLen - sLen - 1 (the leftmost
@@ -289,7 +306,7 @@ def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=hashlib.sha256, 
     M_ = b"\x00" * 8 + mHash + salt
     
     # Step 13. Let H' = Hash(M'), an octet string of length hLen.
-    H_ = hash_func(M_).digest()
+    H_ = hash_func.new(M_).digest()
 
     # Step 14. If H = H', output "consistent." Otherwise, output
     # "inconsistent."
