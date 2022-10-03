@@ -1,57 +1,96 @@
 import hashlib
 from hashlib import sha256
+from logging import exception
 import math
 import os
 import sys
+from secret_data import rsa_key
+#import DataPrimitives
+#from DataPrimitives import I20SP, OS2IP, mgf1
+from Crypto.PublicKey import RSA
+from Crypto.Signature.pss import MGF1
 
-""" The following couple feunctions are helper functions """
 
-# Source: https://en.wikipedia.org/wiki/Mask_generation_function
-def mgf1(seed: bytes, length: int, hash_func=hashlib.sha256) -> bytes:
-    hLen = hash_func().digest_size
-    # https://www.ietf.org/rfc/rfc2437.txt
-    # 1.If l > 2^32(hLen), output "mask too long" and stop.
-    if length > (hLen << 32):
-        raise ValueError("mask too long")
-    # 2.Let T  be the empty octet string.
-    T = b""
-    # 3.For counter from 0 to \lceil{l / hLen}\rceil-1, do the following:
-    # Note: \lceil{l / hLen}\rceil-1 is the number of iterations needed,
-    #       but it's easier to check if we have reached the desired length.
-    counter = 0
-    while len(T) < length:
-        # a.Convert counter to an octet string C of length 4 with the primitive I2OSP: C = I2OSP (counter, 4)
-        C = int.to_bytes(counter, 4, 'big')
-        # b.Concatenate the hash of the seed Z and C to the octet string T: T = T || Hash (Z || C)
-        T += hash_func(seed + C).digest()
-        counter += 1
-    # 4.Output the leading l octets of T as the octet string mask.
-    return T[:length]
+def xor(a: bytes, b: bytes) -> bytes:
+    return bytes(_a ^ _b for _a, _b in zip(a, b))
+
+
+def i2osp_ecc(x: int, xlen: int) -> bytes:
+    """
+    Convert a nonnegative integer `x` to an octet string of a specified length `xlen`.
+    https://tools.ietf.org/html/rfc8017#section-4.1
+    """
+    return x.to_bytes(xlen, byteorder='big', signed=False)
+
+
+def os2ip_ecc(x: bytes) -> int:
+    """
+    Convert an octet string `x` to a nonnegative integer.
+    https://tools.ietf.org/html/rfc8017#section-4.2
+    """
+    return int.from_bytes(x, byteorder='big', signed=False)
+I20SP = i2osp_ecc
+OS2IP = os2ip_ecc
+
+# # Source: https://en.wikipedia.org/wiki/Mask_generation_function
+# def mgf1(seed: bytes, length: int, hash_func=hashlib.sha256) -> bytes:
+#     hLen = hash_func().digest_size
+#     # https://www.ietf.org/rfc/rfc2437.txt
+#     # 1.If l > 2^32(hLen), output "mask too long" and stop.
+#     if length > (hLen << 32):
+#         raise ValueError("mask too long")
+#     # 2.Let T  be the empty octet string.
+#     T = b""
+#     # 3.For counter from 0 to \lceil{l / hLen}\rceil-1, do the following:
+#     # Note: \lceil{l / hLen}\rceil-1 is the number of iterations needed,
+#     #       but it's easier to check if we have reached the desired length.
+#     counter = 0
+#     while len(T) < length:
+#         # a.Convert counter to an octet string C of length 4 with the primitive I20SP: C = I20SP (counter, 4)
+#         C = int.to_bytes(counter, 4, 'big')
+#         # b.Concatenate the hash of the seed Z and C to the octet string T: T = T || Hash (Z || C)
+#         T += hash_func(seed + C).digest()
+#         counter += 1
+#     # 4.Output the leading l octets of T as the octet string mask.
+#     return T[:length]
+
+# def mgf1(mgf_seed, mask_len, hash_class=hashlib.sha1):
+#     '''
+#        Mask Generation Function v1 from the PKCS#1 v2.0 standard.
+#        mgs_seed - the seed, a byte string
+#        mask_len - the length of the mask to generate
+#        hash_class - the digest algorithm to use, default is SHA1
+#        Return value: a pseudo-random mask, as a byte string
+#        '''
+#     h_len = hash_class().digest_size
+#     if mask_len > 0x10000:
+#         raise ValueError('mask too long')
+#     T = b''
+#     for i in range(0, math.ceil(mask_len, h_len)):
+#         C = I20SP(i, 4)
+#         T = T + hash_class(mgf_seed + C).digest()
+#     return T[:mask_len]
 
 # Source: https://stackoverflow.com/questions/39964383/implementation-of-i2osp-and-os2ip
-def os2ip(X):
-        xLen = len(X)
-        X = X[::-1]
-        x = 0
-        for i in range(xLen):
-            x += X[i] * 256**i
-        return x
+# def OS2IP(X: bytes) -> int:
+#     """ Convert an octet string to an integer
+#     Input:
+#     X        octet string to be converted
 
-# Source: https://stackoverflow.com/questions/39964383/implementation-of-i2osp-and-os2ip
-def i2osp(x, xLen):
-        if x >= 256**xLen:
-            raise ValueError("integer too large")
-        digits = []
-
-        while x:
-            digits.append(int(x % 256))
-            x //= 256
-        for i in range(xLen - len(digits)):
-            digits.append(0)
-        return digits[::-1]
+#     Output:
+#     x        corresponding nonnegative integer """
+#     assert isinstance(X, bytes), "X must be a byte string"
+#     xLen = len(X)
+#     X = X[::-1]
+#     x = 0
+#     for i in range(xLen):
+#         x += X[i] * 256**i
+#     return x
 
 
-def emsa_pss_encode(M: bytes, emBits: int, hash_func=hashlib.sha256, MGF=mgf1, sLen: int=0) -> bytes:
+
+
+def emsa_pss_encode(M: bytes, emBits: int, hash_func=hashlib.sha256, MGF=MGF1, sLen: int=0) -> bytes:
     """ Options:
 
     Hash     hash function (hLen denotes the length in octets of the hash
@@ -109,7 +148,7 @@ def emsa_pss_encode(M: bytes, emBits: int, hash_func=hashlib.sha256, MGF=mgf1, s
     DB = PS + b"\x01" + salt
 
     # Step 9. Let dbMask = MGF(H, emLen - hLen - 1).
-    dbMask = MGF(H, emLen - hLen - 1)
+    dbMask = MGF(H, emLen - hLen - 1, hash_func())
 
     # Step 10. Let maskedDB = DB \xor dbMask.
     # TODO: Use consistent xor in encode and verify
@@ -117,60 +156,89 @@ def emsa_pss_encode(M: bytes, emBits: int, hash_func=hashlib.sha256, MGF=mgf1, s
 
     # Step 11. Set the leftmost 8*emLen - emBits bits of the leftmost octet in
     # maskedDB to zero.
-    # FIXME: Could be wrong
-    maskedDB = maskedDB[:-1] + bytes([maskedDB[-1] & (0xff >> (8 * emLen - emBits))])
+    nr_bits_to_zero = 8 * emLen - emBits
+    # Example: nr_bits_to_zero=3 then 0b11111111 >> 3 = 0b00011111
+    mask = 0xFF >> nr_bits_to_zero
+    modified_leftmost_byte = maskedDB[0] & mask
+    # Set the leftmost bits to zero
+    maskedDB = modified_leftmost_byte.to_bytes(1, 'big') + maskedDB[1:]
 
     # Step 12. Let EM = maskedDB || H || 0xbc.
     EM = maskedDB + H + b"\xbc"
     
     return EM
 
-# Input:
-#    (n, e)   RSA public key
-#    s        signature representative, an integer between 0 and n - 1
+def RSASP1(N: int, d: int, m: int) -> int:
+    """ Textbook RSA message signing  
+    Input:
+    (N, d)  private RSA key pair
+    m       message representative, an integer between 0 and N - 1
+    Output:
+    s       signature representative, an integer between 0 and N - 1
+    """
 
-#    Output:
-#    m        message representative, an integer between 0 and n - 1
+    # Step 1. If m is not an integer between 0 and n - 1, output "message
+    # representative out of range" and stop.
+    assert isinstance(m, int), "Message representative must be an integer"
+    assert 0 < m and m < N, "Message representative out of range"
+    
+    # Step 2 Compute s = m^d mod N.
+    s = pow(m, d, N)
 
-#    Error: "signature representative out of range"
-def RSAVP1(n: int, e: int, s: int) -> int:
-    if(s < 0 or s > n - 1):
-        raise Exception("Signature representative out of range")
+    return s
 
-    m = pow(s, e, n)
+def RSAVP1(N: int, e: int, s: int) -> int:
+    """
+    Input:
+    (n, e)   RSA public key
+    s        signature representative, an integer between 0 and n - 1
+
+    Output:
+    m        message representative, an integer between 0 and n - 1
+
+    Error: "signature representative out of range"
+    """
+    assert isinstance(s, int), "Signature representative must be an integer"
+    assert 0 < s and s < N, "Signature representative out of range"
+    
+    m = pow(s, e, N)
     return m
 
-def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=hashlib.sha256, sLen: int=0, MGF=mgf1) -> bool:
-    # Input:
-    # M        message to be verified, an octet string
-    # EM       encoded message, an octet string of length emLen = \ceil
-    #         (emBits/8)
-    # emBits   maximal bit length of the integer OS2IP (EM) (see Section
-    #         4.2), at least 8hLen + 8sLen + 9
+def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=hashlib.sha256, sLen: int=0, MGF=MGF1) -> bool:
+    """     
+    Input:
+    M        message to be verified, an octet string
+    EM       encoded message, an octet string of length emLen = \ceil
+            (emBits/8)
+    emBits   maximal bit length of the integer OS2IP (EM) (see Section
+            4.2), at least 8hLen + 8sLen + 9
 
-    # Output:
-    # True if consistent, False if inconsistent
+    Output:
+    True if consistent, False if inconsistent
 
-    # Step 1. If the length of M is greater than the input limitation for
-    # the hash function (2^61 - 1 octets for SHA-1), output "inconsistent"
-    # and stop.
-    if(len(M) > 2**61 - 1):
-        return False
+    Step 1. If the length of M is greater than the input limitation for
+    the hash function (2^61 - 1 octets for SHA-1), output "inconsistent"
+    and stop. 
+    """
+    assert isinstance(EM, bytes), "EM must be a byte string"
+    assert isinstance(M, bytes), "M must be a byte string"
+    assert len(M) < 2**64 - 1, f"length of M ({len(M)}, {len(M)-2**64-1} too large) is greater than the input limitation for the hash function (2^64 - 1 octets for SHA-256)"
+    #if(len(M) > 2**61 - 1):
+    #    return False
     
     # Step 2. Let mHash = Hash(M), an octet string of length hLen.
     mHash = hash_func(M).digest()
 
     # Step 3. If emLen < hLen + sLen + 2, output "inconsistent" and stop.
     hLen = hash_func().digest_size
+    assert hash_func().digest_size == len(mHash)
     emLen = math.ceil(emBits / 8)
 
-    if(emLen < hLen + sLen + 2):
-        return False
+    assert emLen >= hLen + sLen + 2, f"emLen ({emLen}) < hLen ({hLen}) + sLen ({sLen}) + 2"
     
     # Step 4. If the rightmost octet of EM does not have hexadecimal value
     # 0xbc, output "inconsistent" and stop.
-    if(EM[-1] != 0xbc):
-        return False
+    assert EM[-1] == 0xbc, "Rightmost octet of EM does not have hexadecimal value 0xbc"
     
     # Step 5. Let maskedDB be the leftmost emLen - hLen - 1 octets of EM,
     # and let H be the next hLen octets.
@@ -225,6 +293,9 @@ def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=hashlib.sha256, 
 
     # Step 14. If H = H', output "consistent." Otherwise, output
     # "inconsistent."
+
+    print(f"H:  {H.hex()}")
+    print(f"H': {H_.hex()}")
     return H == H_
 
 
@@ -274,21 +345,27 @@ def sign(K: int, N: int, M: bytes) -> bytes:
     # modBits is the length in bits of the RSA modulus n:
 
     modBits = N.bit_length()
-    #modBits = 0
-    EM = emsa_pss_encode(M, modBits - 1)
-    # Convert the encoded message EM to an integer message
-        #  representative m
-    m = os2ip(EM)
-    # Apply the RSASP1 signature primitive (Section 5.2.1) to the RSA
-        #  private key K and the message representative m to produce an
-        #  integer signature representative s:
-    s = rsasp1(d, m)
+    try:
+        EM = emsa_pss_encode(M, modBits - 1)
+    except Exception as e:
+        print(e)
+        raise ValueError("invalid input")
+    # Step 2.a Convert the encoded message EM to an integer message
+    # representative m
+    m = OS2IP(EM)
 
+    # Step 2.b Apply the RSASP1 signature primitive to the RSA
+    # private key K and the message representative m to produce an
+    # integer signature representative s
+    s = RSASP1(N, K, m)
 
-    s: bytes = b'' 
-    if len(s) != k:
-        raise ValueError('message to long')
-    return s
+    # Step 3.c Convert the signature representative s to a signature
+    # S of length k octets
+    k = N.bit_length()
+    S = I20SP(s, k)
+
+    assert len(S) == k, "length of signature must equal k"
+    return S
 
 
 def verify(n: int, e: int, M: bytes, S: bytes) -> bool:
@@ -301,6 +378,8 @@ def verify(n: int, e: int, M: bytes, S: bytes) -> bool:
    Output:
    "valid signature" or "invalid signature"
     """
+    assert(len(S) == n.bit_length())
+
     # Step 1. Check that the length of the signature is k octets 
     # where k is the length in octets of the RSA modulus n
     k = n.bit_length()
@@ -309,42 +388,63 @@ def verify(n: int, e: int, M: bytes, S: bytes) -> bool:
         raise ValueError("invalid signature")
 
     # Step 2.a Convert the signature to an integer
-    s: int = os2ip(S)
+    s: int = OS2IP(S)
 
     # Step 2.b Apply the RSAVP1 verification primitive (Section 5.2.2) to the 
     # RSA public key (n, e) and the signature representative s to produce an 
     # integer message representative m:
     m: int = RSAVP1(n, e, s)
 
+    modBits = n.bit_length()
+
     # Step 2.c Convert the message representative m to an encoded message EM
     # of length emLen = \ceil ((modBits - 1)/8) octets, where modBits is the 
     # length in bits of the RSA modulus n (see Section 4.1):
-    emLen = math.ceil((n.bit_length() - 1) / 8)
+    emLen = math.ceil((modBits - 1) / 8)
 
     try:
-        EM = i2osp(m, emLen)
+        EM = I20SP(m, emLen)
     except ValueError: # integer too large
+        print("integer too large")
         return False
-
-    modBits = n.bit_length()
 
     return emsa_pss_verify(M, EM, modBits - 1)
 
 if __name__ == '__main__':
-    # This signing & verification test should pass
-    try:
-        m = b'Sign this message'
-        s = sign(m)
-        assert verify(s, m)
-    except AssertionError:
-        print("First signing & verification test failed")
-        sys.exit(1)
+    N = rsa_key['_n']
+    e = rsa_key['_e']
+    d = rsa_key['_d']
+    m = b'Sign this message'
 
-    # This verification test should fail, because the signature is invalid
-    try:
-        m = b'Sign this message'
-        s = sign(m)
-        assert verify(s, b'Hello, world?')
-    except AssertionError:
-        print("Second signing & verification test failed")
-        sys.exit(1)
+    key = RSA.generate(2048)
+    print(f"key.d: {key.d}")
+    print(f"key.n: {key.n}")
+    print(f"key.e: {key.e}")
+    N = key.n
+    e = key.e
+    d = key.d
+
+    s = sign(d, N, m)
+    print(f"s: {s}")
+    result = verify(N, e, m, s)
+    print(f"result: {result}")
+
+    # print(I20SP(255, 1))
+    # print(OS2IP(b'\xff'))
+
+    # This signing & verification test should pass
+    # try:
+    #     s = sign(d, N, m)
+    #     print(f"s: {s}")
+    #     assert verify(N, e, m, s)
+    # except AssertionError:
+    #     print("First signing & verification test failed")
+    #     sys.exit(1)
+
+    # # This verification test should fail, because the signature is invalid
+    # try:
+    #     s = sign(d, N, m)
+    #     assert verify(N, e, m, s)
+    # except AssertionError:
+    #     print("Second signing & verification test failed")
+    #     sys.exit(1)
