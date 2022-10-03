@@ -1,6 +1,7 @@
 import hashlib
 from hashlib import sha256
 import math
+import os
 import sys
 
 """ The following couple feunctions are helper functions """
@@ -50,9 +51,79 @@ def i2osp(x, xLen):
         return digits[::-1]
 
 
-def emsa_pss_encode(m: bytes, modbits) -> bytes:
-    pass
+def emsa_pss_encode(M: bytes, emBits: int, hash_func=hashlib.sha256, MGF=mgf1, sLen: int=0) -> bytes:
+    """ Options:
 
+    Hash     hash function (hLen denotes the length in octets of the hash
+            function output)
+    MGF      mask generation function
+    sLen     intended length in octets of the salt
+
+    Input:
+    M        message to be encoded, an octet string
+    emBits   maximal bit length of the integer OS2IP (EM) (see Section
+            4.2), at least 8hLen + 8sLen + 9
+
+    Output:
+    EM       encoded message, an octet string of length emLen = \ceil
+            (emBits/8) """
+
+    # Step 1. If the length of M is greater than the input limitation for
+    # the hash function (2^61 - 1 octets for SHA-1), output "message too
+    # long" and stop.
+
+    # We're defaulting to SHA-256, which has an input limitation of 2^64 - 1
+    if(len(M) > 2**64 - 1):
+        raise Exception("Message too long")
+    
+    # Step 2. Let mHash = Hash(M), an octet string of length hLen.
+    mHash = hash_func(M).digest()
+
+    # Step 3. If emLen < hLen + sLen + 2, output "encoding error" and stop.
+    hLen = hash_func().digest_size
+    emLen = math.ceil(emBits / 8)
+    if(emLen < hLen + sLen + 2):
+        raise Exception("Encoding error")
+
+    # Step 4. Generate a random octet string salt of length sLen; if sLen = 0,
+    # then salt is the empty string.
+    salt = b""
+    if(sLen > 0):
+        salt = os.urandom(sLen)
+    
+    # Step 5. Let
+    #   M' = (0x)00 00 00 00 00 00 00 00 || mHash || salt;
+    # M' is an octet string of length 8 + hLen + sLen with eight
+    # initial zero octets.
+    M_prime = b"0x00" * 8 + mHash + salt
+
+    # Step 6. Let H = Hash(M'), an octet string of length hLen.
+    H = hash_func(M_prime).digest()
+
+    # Step 7. Generate an octet string PS consisting of emLen - sLen - hLen - 2
+    # zero octets.  The length of PS may be 0.
+    PS = b"\x00" * (emLen - sLen - hLen - 2)
+
+    # Step 8. Let DB = PS || 0x01 || salt; DB is an octet string of length
+    # emLen - hLen - 1.
+    DB = PS + b"\x01" + salt
+
+    # Step 9. Let dbMask = MGF(H, emLen - hLen - 1).
+    dbMask = MGF(H, emLen - hLen - 1)
+
+    # Step 10. Let maskedDB = DB \xor dbMask.
+    # TODO: Use consistent xor in encode and verify
+    maskedDB = bytes([a ^ b for a, b in zip(DB, dbMask)])
+
+    # Step 11. Set the leftmost 8*emLen - emBits bits of the leftmost octet in
+    # maskedDB to zero.
+    # FIXME: Could be wrong
+    maskedDB = maskedDB[:-1] + bytes([maskedDB[-1] & (0xff >> (8 * emLen - emBits))])
+
+    # Step 12. Let EM = maskedDB || H || 0xbc.
+    EM = maskedDB + H + b"\xbc"
+    
+    return EM
 
 # Input:
 #    (n, e)   RSA public key
@@ -69,9 +140,92 @@ def RSAVP1(n: int, e: int, s: int) -> int:
     m = pow(s, e, n)
     return m
 
-def emsa_pss_verify(M: bytes, EM: bytes, modBits: int) -> bool:
+def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=hashlib.sha256, sLen: int=0, MGF=mgf1) -> bool:
+    # Input:
+    # M        message to be verified, an octet string
+    # EM       encoded message, an octet string of length emLen = \ceil
+    #         (emBits/8)
+    # emBits   maximal bit length of the integer OS2IP (EM) (see Section
+    #         4.2), at least 8hLen + 8sLen + 9
+
+    # Output:
+    # True if consistent, False if inconsistent
+
+    # Step 1. If the length of M is greater than the input limitation for
+    # the hash function (2^61 - 1 octets for SHA-1), output "inconsistent"
+    # and stop.
+    if(len(M) > 2**61 - 1):
+        return False
     
+    # Step 2. Let mHash = Hash(M), an octet string of length hLen.
+    mHash = hash_func(M).digest()
+
+    # Step 3. If emLen < hLen + sLen + 2, output "inconsistent" and stop.
+    hLen = hash_func().digest_size
+    emLen = math.ceil(emBits / 8)
+
+    if(emLen < hLen + sLen + 2):
+        return False
     
+    # Step 4. If the rightmost octet of EM does not have hexadecimal value
+    # 0xbc, output "inconsistent" and stop.
+    if(EM[-1] != 0xbc):
+        return False
+    
+    # Step 5. Let maskedDB be the leftmost emLen - hLen - 1 octets of EM,
+    # and let H be the next hLen octets.
+    maskedDB = EM[:emLen - hLen - 1]
+    H = EM[emLen - hLen - 1:- 1]
+
+    # Step 6. If the leftmost 8*emLen - emBits bits of the leftmost octet in
+    # maskedDB are not all equal to zero, output "inconsistent" and stop.
+    leftmost_octet_in_maskedDB = maskedDB[0]
+    number_of_leftmost_bits = 8 * emLen - emBits
+
+    # TODO: A diagram to check if this is correct
+    assert isinstance(leftmost_octet_in_maskedDB, int)
+    if(0 | leftmost_octet_in_maskedDB >> (8 - number_of_leftmost_bits) != 0):
+        return False
+
+    # Step 7. Let dbMask = MGF(H, emLen - hLen - 1).
+    dbMask = MGF(H, emLen - hLen - 1, hash_func)
+
+    # Step 8. Let DB = maskedDB \xor dbMask.
+    DB = bytes([maskedDB[i] ^ dbMask[i] for i in range(len(maskedDB))])
+
+    # Step 9. Set the leftmost 8*emLen - emBits bits of the leftmost octet in
+    # DB to zero.
+    # TODO: Maybe implement this line in multiple steps
+    DB = bytes([DB[0] & (0xff >> number_of_leftmost_bits)]) + DB[1:]
+
+    # Step 10. If the emLen - hLen - sLen - 2 leftmost octets of DB are not
+    # zero or if the octet at position emLen - hLen - sLen - 1 (the leftmost
+    # position is "position 1") does not have hexadecimal value 0x01,
+    # output "inconsistent" and stop.
+    for b in DB[:emLen - hLen - sLen - 2]:
+        if b != 0x00:
+            return False
+
+    if not DB[emLen - hLen - sLen - 2] == 0x01:
+        return False
+
+    # Step 11. Let salt be the last sLen octets of DB.
+    salt = b""
+    if sLen != 0: # If sLen is 0, then DB[-0:] would return the entire DB
+        salt = DB[-sLen:]
+
+    # Step 12. Let M' = (0x)00 00 00 00 00 00 00 00 || mHash || salt;
+    # M' is an octet string of length 8 + hLen + sLen with eight
+    # initial zero octets.
+    assert isinstance(mHash, bytes) and isinstance(salt, bytes)
+    M_ = b"\x00" * 8 + mHash + salt
+    
+    # Step 13. Let H' = Hash(M'), an octet string of length hLen.
+    H_ = hash_func(M_).digest()
+
+    # Step 14. If H = H', output "consistent." Otherwise, output
+    # "inconsistent."
+    return H == H_
 
 
 #                           +-----------+
@@ -99,17 +253,33 @@ def emsa_pss_verify(M: bytes, EM: bytes, modBits: int) -> bool:
 #  EM =  |    maskedDB       |maskedseed|bc|
 #        +-------------------+----------+--+
 
-def sign(M: bytes) -> bytes:
-    e = 2**16 - 1 # 65535 public_key
-    d = 0 # private_key
-    N = 0 # modulus
+def sign(K: int, N: int, M: bytes) -> bytes:
+    """ Sign a message using RSA-PSS
+    Input:
+    K        signer's RSA private key
+    M        message to be signed, an octet string
+    N        the modulus of the RSA public key
+    Output:
+    S       signature, an octet string of length k, where k is the
+            length in octets of the RSA modulus n """
 
-    modbits = 0
-    EM = emsa_pss_encode(M, modbits - 1)
+    # e = 2**16 - 1 # 65535 public_key
+    # d = 0 # private_key
+    # N = 0 # modulus
+
+    # Step 1. EMSA-PSS encoding: Apply the EMSA-PSS encoding operation
+    # to the message M to produce an encoded message EM of length
+    # emLen = \ceil((modBits - 1)/8) octets, such that the bit length of the
+    # integer OS2IP (EM) (see Section 4.2) is at most modBits - 1, where
+    # modBits is the length in bits of the RSA modulus n:
+
+    modBits = N.bit_length()
+    #modBits = 0
+    EM = emsa_pss_encode(M, modBits - 1)
     # Convert the encoded message EM to an integer message
         #  representative m
     m = os2ip(EM)
-# Apply the RSASP1 signature primitive (Section 5.2.1) to the RSA
+    # Apply the RSASP1 signature primitive (Section 5.2.1) to the RSA
         #  private key K and the message representative m to produce an
         #  integer signature representative s:
     s = rsasp1(d, m)
