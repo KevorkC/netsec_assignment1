@@ -1,7 +1,7 @@
 import base64
+import re
 import textwrap
 from pprint import pp
-import re
 
 import requests
 from Crypto.Cipher import AES  # Requires PyCryptodome
