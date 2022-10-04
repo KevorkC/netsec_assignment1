@@ -2,6 +2,7 @@ import hashlib
 from hashlib import sha256
 from logging import exception
 import math
+from multiprocessing.context import assert_spawning
 import os
 import sys
 from secret_data import rsa_key
@@ -9,12 +10,31 @@ from secret_data import rsa_key
 #from DataPrimitives import I20SP, OS2IP, mgf1
 from Crypto.PublicKey import RSA
 from Crypto.Signature.pss import MGF1
+from Crypto.Signature import pss  # only used for testing purposes
+
 from Crypto.Hash import SHA256
 import pretty_errors
 from pprint import pp
 
+MGF = lambda x, y: MGF1(x, y, SHA256)
+
 def xor(a: bytes, b: bytes) -> bytes:
     return bytes(_a ^ _b for _a, _b in zip(a, b))
+
+def byte2int(b: bytes) -> int:
+    """
+    example: byte2int('\x14') == 20
+    """
+    assert isinstance(b, bytes), f"Expected bytes, got {type(b)}"
+    return int.from_bytes(b, byteorder='big')
+
+
+def int2byte(n: int) -> bytes:
+    """
+    example: int2byte(20) == b'\x14'
+    """
+    return n.to_bytes(1, byteorder='big')
+
 
 
 def i2osp_ecc(x: int, xlen: int) -> bytes:
@@ -92,7 +112,7 @@ OS2IP = os2ip_ecc
 
 
 
-def emsa_pss_encode(M: bytes, emBits: int, hash_func=SHA256, MGF=MGF1, sLen: int=0) -> bytes:
+def emsa_pss_encode(M: bytes, emBits: int, hash_func=SHA256, MGF=MGF, sLen: int=0) -> bytes:
     """ Options:
 
     Hash     hash function (hLen denotes the length in octets of the hash
@@ -108,23 +128,22 @@ def emsa_pss_encode(M: bytes, emBits: int, hash_func=SHA256, MGF=MGF1, sLen: int
     Output:
     EM       encoded message, an octet string of length emLen = \ceil
             (emBits/8) """
+    hLen = hash_func.digest_size
+    assert emBits >= 8* hLen + 8* sLen + 9, "Intended encoded message length too short"
 
     # Step 1. If the length of M is greater than the input limitation for
     # the hash function (2^61 - 1 octets for SHA-1), output "message too
     # long" and stop.
 
     # We're defaulting to SHA-256, which has an input limitation of 2^64 - 1
-    if(len(M) > 2**64 - 1):
-        raise Exception("Message too long")
+    assert len(M) <= 2**64 - 1, "Message too long"
     
     # Step 2. Let mHash = Hash(M), an octet string of length hLen.
     mHash = hash_func.new(M).digest()
 
     # Step 3. If emLen < hLen + sLen + 2, output "encoding error" and stop.
-    hLen = hash_func.digest_size
     emLen = math.ceil(emBits / 8)
-    if(emLen < hLen + sLen + 2):
-        raise Exception("Encoding error")
+    assert emLen >= hLen + sLen + 2, "Encoding error"
 
     # Step 4. Generate a random octet string salt of length sLen; if sLen = 0,
     # then salt is the empty string.
@@ -136,7 +155,7 @@ def emsa_pss_encode(M: bytes, emBits: int, hash_func=SHA256, MGF=MGF1, sLen: int
     #   M' = (0x)00 00 00 00 00 00 00 00 || mHash || salt;
     # M' is an octet string of length 8 + hLen + sLen with eight
     # initial zero octets.
-    M_prime = b"0x00" * 8 + mHash + salt
+    M_prime = b"\x00" * 8 + mHash + salt
 
     # Step 6. Let H = Hash(M'), an octet string of length hLen.
     H = hash_func.new(M_prime).digest()
@@ -148,13 +167,13 @@ def emsa_pss_encode(M: bytes, emBits: int, hash_func=SHA256, MGF=MGF1, sLen: int
     # Step 8. Let DB = PS || 0x01 || salt; DB is an octet string of length
     # emLen - hLen - 1.
     DB = PS + b"\x01" + salt
+    assert len(DB) == emLen - hLen - 1, "DB length error"
 
     # Step 9. Let dbMask = MGF(H, emLen - hLen - 1).
-    dbMask = MGF(H, emLen - hLen - 1, hash_func)
+    dbMask = MGF(H, emLen - hLen - 1)
 
     # Step 10. Let maskedDB = DB \xor dbMask.
-    # TODO: Use consistent xor in encode and verify
-    maskedDB = bytes([a ^ b for a, b in zip(DB, dbMask)])
+    maskedDB = xor(DB, dbMask)
 
     # Step 11. Set the leftmost 8*emLen - emBits bits of the leftmost octet in
     # maskedDB to zero.
@@ -163,7 +182,7 @@ def emsa_pss_encode(M: bytes, emBits: int, hash_func=SHA256, MGF=MGF1, sLen: int
     mask = 0xFF >> nr_bits_to_zero
     modified_leftmost_byte = maskedDB[0] & mask
     # Set the leftmost bits to zero
-    maskedDB = modified_leftmost_byte.to_bytes(1, 'big') + maskedDB[1:]
+    maskedDB = int2byte(modified_leftmost_byte) + maskedDB[1:]
 
     # Step 12. Let EM = maskedDB || H || 0xbc.
     EM = maskedDB + H + b"\xbc"
@@ -182,12 +201,13 @@ def RSASP1(N: int, d: int, m: int) -> int:
     # Step 1. If m is not an integer between 0 and n - 1, output "message
     # representative out of range" and stop.
     assert isinstance(m, int), "Message representative must be an integer"
-    assert 0 < m and m < N, "Message representative out of range"
+    assert 0 < m and m <= N - 1, "Message representative out of range"
     
     # Step 2 Compute s = m^d mod N.
     s = pow(m, d, N)
 
     return s
+
 
 def RSAVP1(N: int, e: int, s: int) -> int:
     """
@@ -206,7 +226,7 @@ def RSAVP1(N: int, e: int, s: int) -> int:
     m = pow(s, e, N)
     return m
 
-def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=SHA256, sLen: int=0, MGF=MGF1) -> bool:
+def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=SHA256, sLen: int=0, MGF=MGF) -> bool:
     """     
     Input:
     M        message to be verified, an octet string
@@ -258,30 +278,23 @@ def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=SHA256, sLen: in
         return False
 
     # Step 7. Let dbMask = MGF(H, emLen - hLen - 1).
-    dbMask = MGF(H, emLen - hLen - 1, hash_func)
+    dbMask: bytes = MGF(H, emLen - hLen - 1)
 
     # Step 8. Let DB = maskedDB \xor dbMask.
-    DB = xor(maskedDB, dbMask)
+    DB: bytes = xor(maskedDB, dbMask)
     #DB = bytes([maskedDB[i] ^ dbMask[i] for i in range(len(maskedDB))])
 
     # Step 9. Set the leftmost 8*emLen - emBits bits of the leftmost octet in
     # DB to zero.
 
-    # Bitmask of digits that fill up
-    lmask = 0
-    for i in range(number_of_leftmost_bits):
-        lmask = lmask >> 1 | 0x80
+    assert isinstance(DB, bytes), 'DB must be of type bytes'
+    DB0_as_int: int = DB[0] # TODO but it is the right int???
+    # if number_of_leftmost_bits = 2 then (0xFF >> 2) == '00111111'
+    # so when you & with it the 2 leftmost bits will be zeroed
+    modified_DB0_as_int: int = DB0_as_int & (0xFF >> number_of_leftmost_bits)
+    modified_DB0_as_byte: bytes = int2byte(modified_DB0_as_int)
 
-
-    bchr = lambda x: chr(str(x))
-    bord = lambda x: ord(str(x))
-
-    # TODO: LEFT OFF HERE, Kevork Kristoffer
-    pp({"DB[0]": DB[0], "bord(DB[0])": bord(DB[0]), "~lmask": ~lmask, "bchr(bord(DB[0]) & ~lmask)": bchr(bord(DB[0]) & ~lmask)})
-    DB = bchr(bord(DB[0]) & ~lmask) + DB[1:]
-
-    # TODO: Maybe implement this line in multiple steps
-    # DB = bytes([DB[0] & (0xff >> number_of_leftmost_bits)]) + DB[1:]
+    DB: bytes = modified_DB0_as_byte + DB[1:]
 
     # Step 10. If the emLen - hLen - sLen - 2 leftmost octets of DB are not
     # zero or if the octet at position emLen - hLen - sLen - 1 (the leftmost
@@ -289,9 +302,11 @@ def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=SHA256, sLen: in
     # output "inconsistent" and stop.
     for b in DB[:emLen - hLen - sLen - 2]:
         if b != 0x00:
+            assert False, "The emLen - hLen - sLen - 2 leftmost octets of DB are not zero"
             return False
 
     if not DB[emLen - hLen - sLen - 2] == 0x01:
+        assert False, "The octet at position emLen - hLen - sLen - 1 does not have hexadecimal value 0x01"
         return False
 
     # Step 11. Let salt be the last sLen octets of DB.
@@ -304,6 +319,7 @@ def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=SHA256, sLen: in
     # initial zero octets.
     assert isinstance(mHash, bytes) and isinstance(salt, bytes)
     M_ = b"\x00" * 8 + mHash + salt
+    assert len(M_) == 8 + hLen + sLen, f"len(M_) ({len(M_)}) != 8 + hLen ({hLen}) + sLen ({sLen})"
     
     # Step 13. Let H' = Hash(M'), an octet string of length hLen.
     H_ = hash_func.new(M_).digest()
@@ -350,6 +366,9 @@ def sign(K: int, N: int, M: bytes) -> bytes:
     Output:
     S       signature, an octet string of length k, where k is the
             length in octets of the RSA modulus n """
+    assert isinstance(M, bytes), 'M must be of type bytes'
+    assert isinstance(N, int), 'N must be of type int'
+    assert isinstance(K, int), 'K must be of type int'
 
     # e = 2**16 - 1 # 65535 public_key
     # d = 0 # private_key
@@ -367,18 +386,25 @@ def sign(K: int, N: int, M: bytes) -> bytes:
     except Exception as e:
         print(e)
         raise ValueError("invalid input")
+    
+    assert isinstance(EM, bytes), 'EM must be of type bytes'
+    assert len(EM) == math.ceil((modBits - 1) / 8), f"len(EM) ({len(EM)}) != ceil((modBits - 1) / 8) ({math.ceil((modBits - 1) / 8)})"
+
     # Step 2.a Convert the encoded message EM to an integer message
     # representative m
-    m = OS2IP(EM)
+    m: int = OS2IP(EM)
+    
+    assert m.bit_length() <= modBits - 1, f"m.bit_length() ({m.bit_length()}) > modBits - 1 ({modBits - 1})"
 
     # Step 2.b Apply the RSASP1 signature primitive to the RSA
     # private key K and the message representative m to produce an
     # integer signature representative s
-    s = RSASP1(N, K, m)
+    s: int = RSASP1(N, K, m)
 
     # Step 3.c Convert the signature representative s to a signature
     # S of length k octets
-    k = N.bit_length()
+    # k is length in octets/bytes
+    k = math.ceil(N.bit_length() / 8)
     S = I20SP(s, k)
 
     assert len(S) == k, "length of signature must equal k"
@@ -395,14 +421,11 @@ def verify(n: int, e: int, M: bytes, S: bytes) -> bool:
    Output:
    "valid signature" or "invalid signature"
     """
-    assert(len(S) == n.bit_length())
-
     # Step 1. Check that the length of the signature is k octets 
     # where k is the length in octets of the RSA modulus n
-    k = n.bit_length()
-    print(f"S: {len(S)}, k: {k}")
-    if(len(S) != k):
-        raise ValueError("invalid signature")
+    #k = n.bit_length()
+    k = math.ceil(N.bit_length() / 8)
+    assert(len(S) == k), "length of signature must equal k"
 
     # Step 2.a Convert the signature to an integer
     s: int = OS2IP(S)
@@ -428,23 +451,79 @@ def verify(n: int, e: int, M: bytes, S: bytes) -> bool:
     return emsa_pss_verify(M, EM, modBits - 1)
 
 if __name__ == '__main__':
+    columns = os.get_terminal_size().columns
+    print_horizontal_line = lambda: print("-" * columns)
+
     N = rsa_key['_n']
     e = rsa_key['_e']
     d = rsa_key['_d']
-    m = b'Sign this message'
+    #m = b'Sign this message.'
 
     key = RSA.generate(2048)
-    print(f"key.d: {key.d}")
-    print(f"key.n: {key.n}")
-    print(f"key.e: {key.e}")
+    # print(f"key.d: {key.d}")
+    # print(f"key.n: {key.n}")
+    # print(f"key.e: {key.e}")
     N = key.n
     e = key.e
     d = key.d
 
-    s = sign(d, N, m)
-    print(f"s: {s}")
-    result = verify(N, e, m, s)
-    print(f"result: {result}")
+    m = b'Its me Mario!'
+    m_hash = SHA256.new(m)
+
+    print_horizontal_line()
+    print(f'm = {m}')
+    print()
+    print("Each test tests if the generated RSA-PSS signature, can also verified with RSA-PSS-VERIFY.")
+
+    pycryptodome_rsa_pss = pss.new(key, mask_func=MGF, salt_bytes=0)
+
+    # pycryptodome expects the message m to be hashed beforehand.
+    # this is not standard in RFC 3447
+    print_horizontal_line()
+    print("TEST CASE 1: Using pycryptodome for signature and verification")
+    pycryptodome_signature = pycryptodome_rsa_pss.sign(m_hash)
+    try:
+        pycryptodome_rsa_pss.verify(m_hash, pycryptodome_signature)
+        print("Test successful.")
+    except (ValueError, TypeError):
+        print("Test FAILED..")
+
+    
+    print_horizontal_line()
+    print("TEST CASE 2: Using our signature, and pycryptodome for verification")
+    our_signature = sign(d,N, m)
+    try:
+        pycryptodome_rsa_pss.verify(m_hash, our_signature)
+        print("Test successful.")
+    except (ValueError, TypeError):
+        print("Test FAILED.")
+
+    print_horizontal_line()
+    print("TEST CASE 3: Using pycryptodome for signature, and our verification")
+    pycryptodome_signature = pycryptodome_rsa_pss.sign(m_hash)
+    #print(f'len(pycryptodome_signature): {len(pycryptodome_signature)}')
+    #print(f'len(our_signature): {len(our_signature)}')
+    #print(f'N.bit_length(): {N.bit_length()}')
+    verified: bool = verify(N, e, m, pycryptodome_signature)
+    if verified:
+        print("Test successful.")
+    else:
+        print("Test FAILED.")
+
+    print_horizontal_line()
+    print("TEST CASE 4: Our signautre and verification")
+    our_signature = sign(d,N, m)
+    verified: bool = verify(N, e, m, our_signature)
+    if verified:
+        print("Test successful.")
+    else:
+        print("Test FAILED.")
+
+    print_horizontal_line()
+    # s = sign(d, N, m)
+    # print(f"s: {s}")
+    # result = verify(N, e, m, s)
+    # print(f"result: {result}")
 
     # print(I20SP(255, 1))
     # print(OS2IP(b'\xff'))
