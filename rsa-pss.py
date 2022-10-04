@@ -9,7 +9,6 @@ from Crypto.Hash import SHA256
 from Crypto.PublicKey import RSA  # Only for key generation
 from Crypto.Signature import pss  # only used for testing purposes
 from Crypto.Signature.pss import MGF1
-from sklearn.utils import resample
 
 MGF = lambda x, y: MGF1(x, y, SHA256) # Wrapping pycryptodome's MGF1 function to use SHA256 
 
