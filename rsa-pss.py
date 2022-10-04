@@ -1,20 +1,15 @@
-import hashlib
-from hashlib import sha256
-from logging import exception
 import math
-from multiprocessing.context import assert_spawning
 import os
 import sys
 from secret_data import rsa_key
-#import DataPrimitives
-#from DataPrimitives import I20SP, OS2IP, mgf1
 from Crypto.PublicKey import RSA
 from Crypto.Signature.pss import MGF1
 from Crypto.Signature import pss  # only used for testing purposes
-
 from Crypto.Hash import SHA256
 import pretty_errors
 from pprint import pp
+
+from colors import color
 
 MGF = lambda x, y: MGF1(x, y, SHA256)
 
@@ -35,15 +30,12 @@ def int2byte(n: int) -> bytes:
     """
     return n.to_bytes(1, byteorder='big')
 
-
-
 def i2osp_ecc(x: int, xlen: int) -> bytes:
     """
     Convert a nonnegative integer `x` to an octet string of a specified length `xlen`.
     https://tools.ietf.org/html/rfc8017#section-4.1
     """
     return x.to_bytes(xlen, byteorder='big', signed=False)
-
 
 def os2ip_ecc(x: bytes) -> int:
     """
@@ -332,32 +324,8 @@ def emsa_pss_verify(M: bytes, EM: bytes, emBits: int, hash_func=SHA256, sLen: in
     return H == H_
 
 
-#                           +-----------+
-#                           |     M     |
-#                           +-----------+
-#                                 |
-#                                 V
-#                               Hash
-#                                 |
-#                                 V
-#                   +--------+----------+----------+
-#              M' = |Padding1|  mHash   |   salt   |
-#                   +--------+----------+----------+
-#                                  |
-#        +--------+----------+     V
-#  DB =  |Padding2|maskedseed|   Hash
-#        +--------+----------+     |
-#                  |               |
-#                  V               |    +--+
-#                 xor <--- MGF <---|    |bc|
-#                  |               |    +--+
-#                  |               |      |
-#                  V               V      V
-#        +-------------------+----------+--+
-#  EM =  |    maskedDB       |maskedseed|bc|
-#        +-------------------+----------+--+
 
-def sign(K: int, N: int, M: bytes) -> bytes:
+def sign(K: int, N: int, M: bytes, sLen: int) -> bytes:
     """ Sign a message using RSA-PSS
     Input:
     K        signer's RSA private key
@@ -381,11 +349,8 @@ def sign(K: int, N: int, M: bytes) -> bytes:
     # modBits is the length in bits of the RSA modulus n:
 
     modBits = N.bit_length()
-    try:
-        EM = emsa_pss_encode(M, modBits - 1)
-    except Exception as e:
-        print(e)
-        raise ValueError("invalid input")
+
+    EM = emsa_pss_encode(M, modBits - 1, sLen=sLen)
     
     assert isinstance(EM, bytes), 'EM must be of type bytes'
     assert len(EM) == math.ceil((modBits - 1) / 8), f"len(EM) ({len(EM)}) != ceil((modBits - 1) / 8) ({math.ceil((modBits - 1) / 8)})"
@@ -411,7 +376,7 @@ def sign(K: int, N: int, M: bytes) -> bytes:
     return S
 
 
-def verify(n: int, e: int, M: bytes, S: bytes) -> bool:
+def verify(n: int, e: int, M: bytes, S: bytes, sLen: int) -> bool:
     """ Verify a signature using RSA-PSS 
     Input:
     (n, e)   signer's RSA public key
@@ -448,8 +413,10 @@ def verify(n: int, e: int, M: bytes, S: bytes) -> bool:
         print("integer too large")
         return False
 
-    return emsa_pss_verify(M, EM, modBits - 1)
+    return emsa_pss_verify(M, EM, modBits - 1, sLen=sLen)
 
+
+# TEST IMPLEMENTATION
 if __name__ == '__main__':
     columns = os.get_terminal_size().columns
     print_horizontal_line = lambda: print("-" * columns)
@@ -457,90 +424,77 @@ if __name__ == '__main__':
     N = rsa_key['_n']
     e = rsa_key['_e']
     d = rsa_key['_d']
-    #m = b'Sign this message.'
 
     key = RSA.generate(2048)
-    # print(f"key.d: {key.d}")
-    # print(f"key.n: {key.n}")
-    # print(f"key.e: {key.e}")
     N = key.n
     e = key.e
-    d = key.d
-
-    m = b'Its me Mario!'
-    m_hash = SHA256.new(m)
-
-    print_horizontal_line()
-    print(f'm = {m}')
-    print()
-    print("Each test tests if the generated RSA-PSS signature, can also verified with RSA-PSS-VERIFY.")
-
-    pycryptodome_rsa_pss = pss.new(key, mask_func=MGF, salt_bytes=0)
-
-    # pycryptodome expects the message m to be hashed beforehand.
-    # this is not standard in RFC 3447
-    print_horizontal_line()
-    print("TEST CASE 1: Using pycryptodome for signature and verification")
-    pycryptodome_signature = pycryptodome_rsa_pss.sign(m_hash)
-    try:
-        pycryptodome_rsa_pss.verify(m_hash, pycryptodome_signature)
-        print("Test successful.")
-    except (ValueError, TypeError):
-        print("Test FAILED..")
-
+    d = key.d 
     
-    print_horizontal_line()
-    print("TEST CASE 2: Using our signature, and pycryptodome for verification")
-    our_signature = sign(d,N, m)
-    try:
-        pycryptodome_rsa_pss.verify(m_hash, our_signature)
-        print("Test successful.")
-    except (ValueError, TypeError):
-        print("Test FAILED.")
+    test_id = 1
+    def test_our_implementation_against_pycryptodome_implementation(m: bytes, salt_length: int) -> None:
+        m_hash = SHA256.new(m)
+        global test_id
 
-    print_horizontal_line()
-    print("TEST CASE 3: Using pycryptodome for signature, and our verification")
-    pycryptodome_signature = pycryptodome_rsa_pss.sign(m_hash)
-    #print(f'len(pycryptodome_signature): {len(pycryptodome_signature)}')
-    #print(f'len(our_signature): {len(our_signature)}')
-    #print(f'N.bit_length(): {N.bit_length()}')
-    verified: bool = verify(N, e, m, pycryptodome_signature)
-    if verified:
-        print("Test successful.")
-    else:
-        print("Test FAILED.")
+        print_horizontal_line()
+        print()
+        print("Each test tests if the generated RSA-PSS signature, can also verified with RSA-PSS-VERIFY.")
 
-    print_horizontal_line()
-    print("TEST CASE 4: Our signautre and verification")
-    our_signature = sign(d,N, m)
-    verified: bool = verify(N, e, m, our_signature)
-    if verified:
-        print("Test successful.")
-    else:
-        print("Test FAILED.")
+        pycryptodome_rsa_pss = pss.new(key, mask_func=MGF, salt_bytes=salt_length)
 
-    print_horizontal_line()
-    # s = sign(d, N, m)
-    # print(f"s: {s}")
-    # result = verify(N, e, m, s)
-    # print(f"result: {result}")
+        # pycryptodome expects the message m to be hashed beforehand.
+        # this is not standard in RFC 3447
+        print_horizontal_line()
+        print(color(f"TEST CASE {test_id}.1:", 'blue'), end='')
+        print(" Using pycryptodome for signature and verification")
+        pycryptodome_signature = pycryptodome_rsa_pss.sign(m_hash)
+        try:
+            pycryptodome_rsa_pss.verify(m_hash, pycryptodome_signature)
+            print(color("Test SUCCESSFUL.", 'green'))
+        except (ValueError, TypeError):
+            print(color("Test FAILED.",'red'))
 
-    # print(I20SP(255, 1))
-    # print(OS2IP(b'\xff'))
+        
+        print_horizontal_line()
+        print(color(f"TEST CASE {test_id}.2:", 'blue'), end='')
+        print(" Using our signature, and pycryptodome for verification")
+        our_signature = sign(d,N, m, salt_length)
+        try:
+            pycryptodome_rsa_pss.verify(m_hash, our_signature)
+            
+            print(color("Test SUCCESSFUL.", 'green'))
+        except (ValueError, TypeError):
+            print(color("Test FAILED.",'red'))
 
-    # This signing & verification test should pass
-    # try:
-    #     s = sign(d, N, m)
-    #     print(f"s: {s}")
-    #     assert verify(N, e, m, s)
-    # except AssertionError:
-    #     print("First signing & verification test failed")
-    #     sys.exit(1)
+        print_horizontal_line()
+        print(color(f"TEST CASE {test_id}.3:", 'blue'), end='')
+        print(" Using pycryptodome for signature, and our verification")
+        pycryptodome_signature = pycryptodome_rsa_pss.sign(m_hash)
+        verified: bool = verify(N, e, m, pycryptodome_signature, salt_length)
+        if verified:
+            print(color("Test SUCCESSFUL.", 'green'))
+        else:
+            print(color("Test FAILED.",'red'))
 
-    # # This verification test should fail, because the signature is invalid
-    # try:
-    #     s = sign(d, N, m)
-    #     assert verify(N, e, m, s)
-    # except AssertionError:
-    #     print("Second signing & verification test failed")
-    #     sys.exit(1)
+        print_horizontal_line()
+        print(color(f"TEST CASE {test_id}.4:", 'blue'), end='')
+        print(" Our signature and verification")
+        our_signature = sign(d,N, m, salt_length)
+        verified: bool = verify(N, e, m, our_signature, salt_length)
+        if verified:
+            print(color("Test SUCCESSFUL.", 'green'))
+        else:
+            print(color("Test FAILED.",'red'))
+
+        print_horizontal_line()
+        test_id += 1
+
+    for salt_length in [0, 1, SHA256.digest_size]:
+        print('First test we try with the following string as m:')
+        m = b'Its me Mario!'
+        print(f'm = {m}')
+        test_our_implementation_against_pycryptodome_implementation(m, salt_length=salt_length)
+
+        print('testing with a jpeg file ./spiderman.jpg')
+        with open('spiderman.jpg', 'rb') as f:
+            image = f.read()
+            test_our_implementation_against_pycryptodome_implementation(image, salt_length=salt_length)
